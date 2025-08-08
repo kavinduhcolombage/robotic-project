@@ -1,0 +1,206 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// Wi-Fi credentials
+const char* ssid = "HONOR X7c";
+const char* password = "12345678";
+
+// Servo pins
+const int Head_vertical_pin = 18;
+const int Head_Horizontal_Pin = 19;
+
+// Servo objects
+Servo Head_ver_Servo;
+Servo Head_hori_Servo;
+
+// Servo angles
+int angle_head_ver = 110;
+int angle_head_hori = 100;
+
+WebServer server(80);
+
+// HTML page with sliders and buttons
+String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Head Control</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; background: #f2f2f2; padding-top: 20px; }
+    h2 { color: #333; }
+    input[type=range] { width: 300px; margin-bottom: 15px; }
+    button { padding: 10px 20px; margin: 10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <h2>Left Arm - Vertical: <span id="lvVal">90</span>°</h2>
+  <input type="range" id="lvSlider" min="0" max="180" value="90" onchange="update('lv', this.value)"><br>
+
+  <h2>Left Arm - Horizontal: <span id="lhVal">90</span>°</h2>
+  <input type="range" id="lhSlider" min="0" max="180" value="90" onchange="update('lh', this.value)"><br>
+
+
+  <hr>
+  <button onclick="preset('lookingDirect')">look direct</button>
+  <button onclick="preset('lookup')">look up</button>
+  <button onclick="preset('lookdown')">look down</button>
+  <button onclick="preset('lookleft')">look left</button>
+  <button onclick="preset('lookright')">look right</button>
+
+<script>
+function update(servo, val) {
+  document.getElementById(servo + 'Val').innerText = val;
+  fetch(`/setServo?${servo}=${val}`);
+}
+
+function preset(action) {
+  fetch(`/preset?action=${action}`);
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Serve main page
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", htmlPage);
+  });
+
+  // Individual servo update (sliders)
+  // server.on("/setServo", HTTP_GET, []() {
+  //   if (server.hasArg("lv")) {
+  //     angle_LV = constrain(server.arg("lv").toInt(), 0, 180);
+  //     leftVertServo.attach(L_VerticalPin, 500, 2400);
+  //     leftVertServo.write(angle_LV);
+  //     delay(300);
+  //     leftVertServo.detach();
+  //     Serial.printf("Left Vertical: %d\n", angle_LV);
+  //   }
+  //   if (server.hasArg("lh")) {
+  //     angle_LH = constrain(server.arg("lh").toInt(), 0, 180);
+  //     leftHorizServo.attach(L_HorizontalPin, 500, 2400);
+  //     leftHorizServo.write(angle_LH);
+  //     delay(300);
+  //     leftHorizServo.detach();
+  //     Serial.printf("Left Horizontal: %d\n", angle_LH);
+  //   }
+  //   if (server.hasArg("rv")) {
+  //     angle_RV = constrain(server.arg("rv").toInt(), 0, 180);
+  //     rightVertServo.attach(R_VerticalPin, 500, 2400);
+  //     rightVertServo.write(angle_RV);
+  //     delay(300);
+  //     rightVertServo.detach();
+  //     Serial.printf("Right Vertical: %d\n", angle_RV);
+  //   }
+  //   if (server.hasArg("rh")) {
+  //     angle_RH = constrain(server.arg("rh").toInt(), 0, 180);
+  //     rightHorizServo.attach(R_HorizontalPin, 500, 2400);
+  //     rightHorizServo.write(angle_RH);
+  //     delay(300);
+  //     rightHorizServo.detach();
+  //     Serial.printf("Right Horizontal: %d\n", angle_RH);
+  //   }
+  //   server.send(200, "text/plain", "OK");
+  // });
+
+  // Preset action (buttons)
+  server.on("/preset", HTTP_GET, []() {
+    if (!server.hasArg("action")) {
+      server.send(400);
+      return;
+    }
+    String action = server.arg("action");
+
+    if (action == "lookingDirect") {
+      angle_head_ver = 110;
+      angle_head_hori = 100;
+    } else if (action == "lookup") {
+      angle_head_ver = 82;
+      angle_head_hori = 100;
+    } else if (action == "lookdown") {
+      angle_head_ver = 120;
+      angle_head_hori = 100;
+    } else if (action == "lookleft") {
+      angle_head_ver = 110;
+      angle_head_hori = 140;
+    } else if (action == "lookright") {
+      angle_head_ver = 110;
+      angle_head_hori = 65;
+    } else {
+      server.send(400, "text/plain", "Unknown preset");
+      return;
+    }
+
+    // 1) Attach all
+    Head_ver_Servo.attach(Head_vertical_pin, 500, 2400);
+    Head_hori_Servo.attach(Head_Horizontal_Pin, 500, 2400);
+
+    // 2) Write all angles immediately
+    Head_ver_Servo.write(angle_head_ver);
+    Head_hori_Servo.write(angle_head_hori);
+
+    // 3) Single delay to allow movement
+    delay(500);
+
+    // 4) Detach all
+    Head_ver_Servo.detach();
+    Head_hori_Servo.detach();
+
+    Serial.println("Preset: " + action);
+    server.send(200, "text/plain", "Done");
+  });
+
+  // Endpoint to receive x angle for head horizontal movement
+  server.on("/servo", HTTP_GET, []() {
+    bool updated = false;
+
+    if (server.hasArg("x")) {
+      angle_head_hori = constrain(server.arg("x").toInt(), 0, 180);
+      Head_hori_Servo.attach(Head_Horizontal_Pin, 500, 2400);
+      Head_hori_Servo.write(angle_head_hori);
+      delay(300);
+      Head_hori_Servo.detach();
+      Serial.printf("Received X Angle: %d\n", angle_head_hori);
+      updated = true;
+    }
+
+    if (server.hasArg("y")) {
+      angle_head_ver = constrain(server.arg("y").toInt(), 0, 180);
+      Head_ver_Servo.attach(Head_vertical_pin, 500, 2400);
+      Head_ver_Servo.write(angle_head_ver);
+      delay(300);
+      Head_ver_Servo.detach();
+      Serial.printf("Received Y Angle: %d\n", angle_head_ver);
+      updated = true;
+    }
+
+    if (updated) {
+      server.send(200, "text/plain", "Servo angle(s) updated");
+    } else {
+      server.send(400, "text/plain", "Missing 'x' or 'y' parameter");
+    }
+  });
+
+
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
