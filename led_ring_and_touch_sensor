@@ -1,0 +1,393 @@
+// ESP32 LED ring + touch + web server
+// Same styles and animations as before. Only touch handling updated to send
+// notification on state change (rising edge) to avoid continuous notifications.
+//
+// Requirements: FastLED library
+// Connect WS2812 data pin to DATA_PIN and share GND with ESP32.
+// If you use a digital touch module (TTP223), set TOUCH_IS_DIGITAL = true.
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <FastLED.h>
+
+/////////////////////
+// CONFIG - EDIT
+const char* WIFI_SSID = "HONOR X7c";
+const char* WIFI_PASS = "12345678";
+
+#define NUM_LEDS 16
+#define DATA_PIN 5        // WS2812 data pin (change if needed)
+#define TOUCH_IS_DIGITAL true
+#define TOUCH_PIN 4     // digital touch module OUT -> GPIO33 (change if needed)
+
+// If using native touchRead(), adjust this threshold after testing
+const int TOUCH_THRESHOLD = 30; // lower => more sensitive
+
+// Set this to your laptop listener URL for touch events (example below).
+const char* LAPTOP_CALLBACK_URL = "http://192.168.213.248:5000/touch"; // <-- change to your laptop IP and port
+const unsigned long TOUCH_DEBOUNCE_MS = 600;
+
+/////////////////////
+WebServer server(80);
+CRGB leds[NUM_LEDS];
+
+// Animation state (unchanged)
+enum Style {
+  STYLE_OFF,
+  STYLE_LOADING,
+  STYLE_TRAIN,
+  STYLE_RAINBOW,
+  STYLE_BLINK,
+  STYLE_SOLID,
+  STYLE_CHASE,
+  STYLE_STARTUP,
+  STYLE_BLUE_LOADING,
+  STYLE_PURPLE_SPEAKING,
+  STYLE_YELLOW_PROCESSING,
+  STYLE_GREEN,
+  STYLE_RED,
+  STYLE_ORANGE
+};
+
+volatile Style currentStyle = STYLE_OFF;
+CRGB solidColor = CRGB::Red;
+unsigned long lastAnim = 0;
+int animPos = 0;
+unsigned long lastTouchTime = 0;
+
+// NEW: keep previous touch state to detect edges
+bool prevTouchState = false;
+
+/////////////////////
+// helper: parse color arg (names or "r,g,b")
+CRGB parseColorArg(const String &s) {
+  String t = s;
+  t.trim();
+  t.toLowerCase();
+  if (t == "red") return CRGB::Red;
+  if (t == "green") return CRGB::Green;
+  if (t == "blue") return CRGB::Blue;
+  if (t == "white") return CRGB::White;
+  if (t == "yellow") return CRGB::Yellow;
+  if (t == "purple") return CRGB::Purple;
+  if (t.indexOf(',') > 0) {
+    int i1 = t.indexOf(',');
+    int i2 = t.lastIndexOf(',');
+    int a = t.substring(0, i1).toInt();
+    int b = t.substring(i1 + 1, i2).toInt();
+    int c = t.substring(i2 + 1).toInt();
+    return CRGB(constrain(a,0,255), constrain(b,0,255), constrain(c,0,255));
+  }
+  return CRGB::Purple;
+}
+
+/////////////////////
+// HTTP handlers
+void handleRoot() {
+  String html = "<h1>ESP32 LED Controller</h1>";
+  html += "<p>Use <code>/style?name=loading</code> or <code>/style?name=rainbow</code></p>";
+  html += "<p>Available: loading, train, rainbow, blink, solid, chase, off, startup, blue_loading, purple_speaking</p>";
+  html += "<p>Also: yellow_processing, green, red, orange</p>";
+  server.send(200, "text/html", html);
+}
+
+void handleStyle() {
+  String name = server.arg("name");
+  String colorArg = server.arg("color");
+  if (name.length() == 0) {
+    server.send(400, "text/plain", "missing 'name' query param");
+    return;
+  }
+  name.toLowerCase();
+
+  if (name == "loading") currentStyle = STYLE_LOADING;
+  else if (name == "train") currentStyle = STYLE_TRAIN;
+  else if (name == "rainbow") currentStyle = STYLE_RAINBOW;
+  else if (name == "blink") currentStyle = STYLE_BLINK;
+  else if (name == "chase") currentStyle = STYLE_CHASE;
+  else if (name == "solid") {
+    currentStyle = STYLE_SOLID;
+    if (colorArg.length()) solidColor = parseColorArg(colorArg);
+  }
+  else if (name == "off") currentStyle = STYLE_OFF;
+  else if (name == "startup") currentStyle = STYLE_STARTUP;
+  else if (name == "blue_loading") currentStyle = STYLE_BLUE_LOADING;
+  else if (name == "purple_speaking") currentStyle = STYLE_PURPLE_SPEAKING;
+  else if (name == "yellow_processing") currentStyle = STYLE_YELLOW_PROCESSING;
+  else if (name == "green") currentStyle = STYLE_GREEN;
+  else if (name == "red") currentStyle = STYLE_RED;
+  else if (name == "orange") currentStyle = STYLE_ORANGE;
+  else {
+    server.send(400, "text/plain", "unknown style");
+    return;
+  }
+
+  // reset animation state on style change so patterns start fresh
+  animPos = 0;
+  lastAnim = 0;
+
+  server.send(200, "text/plain", "OK - set style to: " + name);
+  Serial.printf("Style set to %s\n", name.c_str());
+}
+
+void handleStatus() {
+  String s = "{\"style\":";
+  s += String((int)currentStyle);
+  s += ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+  server.send(200, "application/json", s);
+}
+
+void setupServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/style", HTTP_GET, handleStyle);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.begin();
+}
+
+/////////////////////
+// Touch -> notify laptop (unchanged)
+void notifyLaptop() {
+  if (strlen(LAPTOP_CALLBACK_URL) == 0) return;
+  HTTPClient http;
+  http.begin(LAPTOP_CALLBACK_URL);
+  int code = http.GET();
+  Serial.printf("Touch notify -> %s (code=%d)\n", LAPTOP_CALLBACK_URL, code);
+  http.end();
+}
+
+/////////////////////
+// Helpers for animations (unchanged)
+void setAll(const CRGB &c) {
+  for (int i=0;i<NUM_LEDS;i++) leds[i]=c;
+  FastLED.show();
+}
+
+// loading: single white pixel rotating
+void animateLoading() {
+  unsigned long now = millis();
+  if (now - lastAnim < 80) return;
+  lastAnim = now;
+  for (int i=0;i<NUM_LEDS;i++) leds[i] = CRGB::Black;
+  leds[animPos] = CRGB::White;
+  animPos = (animPos + 1) % NUM_LEDS;
+  FastLED.show();
+}
+
+// train: block of 4 colorful pixels
+void animateTrain() {
+  unsigned long now = millis();
+  if (now - lastAnim < 120) return;
+  lastAnim = now;
+  for (int i=0;i<NUM_LEDS;i++) leds[i] = CRGB::Black;
+  for (int k=0;k<4;k++) {
+    int idx = (animPos + k) % NUM_LEDS;
+    leds[idx] = CHSV((animPos*8 + k*20) & 255, 255, 200);
+  }
+  animPos = (animPos + 1) % NUM_LEDS;
+  FastLED.show();
+}
+
+// rainbow: continuous rainbow
+void animateRainbow() {
+  unsigned long now = millis();
+  if (now - lastAnim < 20) return;
+  lastAnim = now;
+  for (int i=0;i<NUM_LEDS;i++) {
+    leds[i] = CHSV((i * 255 / NUM_LEDS + animPos) & 255, 255, 180);
+  }
+  animPos = (animPos + 1) & 255;
+  FastLED.show();
+}
+
+// blink: on/off
+void animateBlink() {
+  unsigned long now = millis();
+  if (now - lastAnim < 400) return;
+  lastAnim = now;
+  static bool on = false;
+  on = !on;
+  if (on) setAll(CRGB::White);
+  else setAll(CRGB::Black);
+}
+
+// chase: small orange chase
+void animateChase() {
+  unsigned long now = millis();
+  if (now - lastAnim < 80) return;
+  lastAnim = now;
+  for (int i=0;i<NUM_LEDS;i++) leds[i] = CRGB::Black;
+  leds[animPos] = CRGB::Orange;
+  leds[(animPos+NUM_LEDS-2)%NUM_LEDS] = CRGB::Yellow;
+  animPos = (animPos + 1) % NUM_LEDS;
+  FastLED.show();
+}
+
+// startup: fill then fade (warm white)
+void animateStartup() {
+  unsigned long now = millis();
+  if (now - lastAnim < 60) return;
+  lastAnim = now;
+
+  int cycleLen = NUM_LEDS * 2;
+  int pos = animPos % cycleLen;
+  int fill;
+  if (pos < NUM_LEDS) fill = pos;
+  else fill = cycleLen - pos;
+
+  for (int i=0;i<NUM_LEDS;i++) {
+    if (i <= fill) {
+      uint8_t b = 120 + (uint8_t)((uint16_t)(i * (135 / max(1, NUM_LEDS-1))));
+      leds[i] = CRGB(b, b-10, b-30);
+    } else {
+      leds[i] = CRGB::Black;
+    }
+  }
+
+  animPos = (animPos + 1) % cycleLen;
+  FastLED.show();
+}
+
+// blue_loading: blue pixel with tail
+void animateBlueLoading() {
+  unsigned long now = millis();
+  if (now - lastAnim < 70) return;
+  lastAnim = now;
+
+  int tail = 4;
+  for (int i=0;i<NUM_LEDS;i++) leds[i] = CRGB::Black;
+  for (int k=0;k<tail;k++) {
+    int idx = (animPos - k + NUM_LEDS) % NUM_LEDS;
+    int brightness = 255 - k * 60;
+    if (brightness < 0) brightness = 0;
+    leds[idx] = CRGB(0, 0, brightness);
+  }
+  animPos = (animPos + 1) % NUM_LEDS;
+  FastLED.show();
+}
+
+// purple_speaking: pulsing purple
+void animatePurpleSpeaking() {
+  unsigned long now = millis();
+  if (now - lastAnim < 25) return;
+  lastAnim = now;
+
+  animPos = (animPos + 4) & 255;
+  uint8_t tri = (uint8_t)animPos;
+  if (tri > 127) tri = 255 - tri;
+  uint8_t val = tri * 2;
+
+  for (int i=0;i<NUM_LEDS;i++) {
+    leds[i] = CHSV(170, 200, val);
+  }
+  FastLED.show();
+}
+
+// yellow_processing - train-like but yellow tones
+void animateYellowProcessing() {
+  unsigned long now = millis();
+  if (now - lastAnim < 110) return;
+  lastAnim = now;
+  for (int i=0;i<NUM_LEDS;i++) leds[i] = CRGB::Black;
+
+  int len = 4; // length of the yellow train
+  for (int k=0;k<len;k++) {
+    int idx = (animPos + k) % NUM_LEDS;
+    uint8_t b = 200 - k * 35; // decreasing brightness along tail
+    if (b < 0) b = 0;
+    leds[idx] = CRGB(b, b, 0); // yellow-ish (R,G)
+  }
+  animPos = (animPos + 1) % NUM_LEDS;
+  FastLED.show();
+}
+
+/////////////////////
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
+  setAll(CRGB::Black);
+
+  // WiFi connect
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+    if (millis() - start > 20000) break;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connect failed - continuing anyway (no AP mode).");
+  }
+
+  // touch pin setup
+  if (TOUCH_IS_DIGITAL) {
+    pinMode(TOUCH_PIN, INPUT);
+    prevTouchState = (digitalRead(TOUCH_PIN) == HIGH); // initialize prev state
+  } else {
+    prevTouchState = false;
+  }
+
+  setupServer();
+}
+
+void loop() {
+  server.handleClient();
+
+  // ---- TOUCH read with edge detection & debounce (updated) ----
+  bool currentTouched = false;
+  if (TOUCH_IS_DIGITAL) {
+    currentTouched = (digitalRead(TOUCH_PIN) == HIGH);
+  } else {
+    int val = touchRead(TOUCH_PIN);
+    currentTouched = (val < TOUCH_THRESHOLD); // adjust threshold per your board
+  }
+
+  // detect change in touch state
+  if (currentTouched != prevTouchState) {
+    // state changed
+    prevTouchState = currentTouched;
+
+    // only notify on transition: NOT touched -> Touched (rising edge)
+    if (currentTouched) {
+      // apply debounce: ignore if too soon since last notify
+      if (millis() - lastTouchTime > TOUCH_DEBOUNCE_MS) {
+        Serial.println("TOUCH detected! (edge)");
+        notifyLaptop();
+        lastTouchTime = millis();
+      } else {
+        Serial.println("Touch edge detected but ignored due to debounce");
+      }
+    } else {
+      // touch released / toggled off
+      Serial.println("Touch state: RELEASED/OFF");
+    }
+  }
+  // -------------------------------------------------------------
+
+  // run the chosen animation (non-blocking)
+  switch (currentStyle) {
+    case STYLE_LOADING: animateLoading(); break;
+    case STYLE_TRAIN: animateTrain(); break;
+    case STYLE_RAINBOW: animateRainbow(); break;
+    case STYLE_BLINK: animateBlink(); break;
+    case STYLE_SOLID: setAll(solidColor); break;
+    case STYLE_CHASE: animateChase(); break;
+    case STYLE_STARTUP: animateStartup(); break;
+    case STYLE_BLUE_LOADING: animateBlueLoading(); break;
+    case STYLE_PURPLE_SPEAKING: animatePurpleSpeaking(); break;
+    case STYLE_YELLOW_PROCESSING: animateYellowProcessing(); break;
+    case STYLE_GREEN: setAll(CRGB::Green); break;
+    case STYLE_RED: setAll(CRGB::Red); break;
+    case STYLE_ORANGE: setAll(CRGB::Orange); break;
+    default: /* OFF */ break;
+  }
+}
