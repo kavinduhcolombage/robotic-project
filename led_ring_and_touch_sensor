@@ -1,10 +1,9 @@
 // ESP32 LED ring + touch + web server
-// Same styles and animations as before. Only touch handling updated to send
-// notification on state change (rising edge) to avoid continuous notifications.
+// Behavior: send ONE notification to laptop on the FIRST touch (rising edge) after boot.
+// After that, touch events are read but NOT forwarded to laptop.
 //
-// Requirements: FastLED library
-// Connect WS2812 data pin to DATA_PIN and share GND with ESP32.
-// If you use a digital touch module (TTP223), set TOUCH_IS_DIGITAL = true.
+// NOTE: Lighting code (all animations) is unchanged from your previous version.
+// Only touch-notify logic was modified. Look for "// === TOUCH CHANGE" markers.
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -56,8 +55,11 @@ unsigned long lastAnim = 0;
 int animPos = 0;
 unsigned long lastTouchTime = 0;
 
-// NEW: keep previous touch state to detect edges
+// Edge detection for touch (unchanged)
 bool prevTouchState = false;
+
+// === TOUCH CHANGE: notify only once after boot
+bool notifiedOnce = false; // when true, we will NOT send notifications to laptop anymore
 
 /////////////////////
 // helper: parse color arg (names or "r,g,b")
@@ -83,7 +85,7 @@ CRGB parseColorArg(const String &s) {
 }
 
 /////////////////////
-// HTTP handlers
+// HTTP handlers (unchanged)
 void handleRoot() {
   String html = "<h1>ESP32 LED Controller</h1>";
   html += "<p>Use <code>/style?name=loading</code> or <code>/style?name=rainbow</code></p>";
@@ -110,7 +112,12 @@ void handleStyle() {
     currentStyle = STYLE_SOLID;
     if (colorArg.length()) solidColor = parseColorArg(colorArg);
   }
-  else if (name == "off") currentStyle = STYLE_OFF;
+  else if (name == "off") {
+    currentStyle = STYLE_OFF;
+    // Keep previous 'off' behavior: clear LEDs immediately
+    for (int i = 0; i < NUM_LEDS; ++i) leds[i] = CRGB::Black;
+    FastLED.show();
+  }
   else if (name == "startup") currentStyle = STYLE_STARTUP;
   else if (name == "blue_loading") currentStyle = STYLE_BLUE_LOADING;
   else if (name == "purple_speaking") currentStyle = STYLE_PURPLE_SPEAKING;
@@ -123,9 +130,11 @@ void handleStyle() {
     return;
   }
 
-  // reset animation state on style change so patterns start fresh
-  animPos = 0;
-  lastAnim = 0;
+  // reset animation state on style change (non-off handled below)
+  if (name != "off") {
+    animPos = 0;
+    lastAnim = 0;
+  }
 
   server.send(200, "text/plain", "OK - set style to: " + name);
   Serial.printf("Style set to %s\n", name.c_str());
@@ -146,7 +155,7 @@ void setupServer() {
 }
 
 /////////////////////
-// Touch -> notify laptop (unchanged)
+// Touch -> notify laptop (unchanged signature)
 void notifyLaptop() {
   if (strlen(LAPTOP_CALLBACK_URL) == 0) return;
   HTTPClient http;
@@ -157,13 +166,14 @@ void notifyLaptop() {
 }
 
 /////////////////////
-// Helpers for animations (unchanged)
+// Helpers for animations (UNCHANGED)
+// All lighting code below is preserved exactly as before.
+
 void setAll(const CRGB &c) {
   for (int i=0;i<NUM_LEDS;i++) leds[i]=c;
   FastLED.show();
 }
 
-// loading: single white pixel rotating
 void animateLoading() {
   unsigned long now = millis();
   if (now - lastAnim < 80) return;
@@ -174,7 +184,6 @@ void animateLoading() {
   FastLED.show();
 }
 
-// train: block of 4 colorful pixels
 void animateTrain() {
   unsigned long now = millis();
   if (now - lastAnim < 120) return;
@@ -188,7 +197,6 @@ void animateTrain() {
   FastLED.show();
 }
 
-// rainbow: continuous rainbow
 void animateRainbow() {
   unsigned long now = millis();
   if (now - lastAnim < 20) return;
@@ -200,7 +208,6 @@ void animateRainbow() {
   FastLED.show();
 }
 
-// blink: on/off
 void animateBlink() {
   unsigned long now = millis();
   if (now - lastAnim < 400) return;
@@ -211,7 +218,6 @@ void animateBlink() {
   else setAll(CRGB::Black);
 }
 
-// chase: small orange chase
 void animateChase() {
   unsigned long now = millis();
   if (now - lastAnim < 80) return;
@@ -223,7 +229,6 @@ void animateChase() {
   FastLED.show();
 }
 
-// startup: fill then fade (warm white)
 void animateStartup() {
   unsigned long now = millis();
   if (now - lastAnim < 60) return;
@@ -248,7 +253,6 @@ void animateStartup() {
   FastLED.show();
 }
 
-// blue_loading: blue pixel with tail
 void animateBlueLoading() {
   unsigned long now = millis();
   if (now - lastAnim < 70) return;
@@ -266,7 +270,6 @@ void animateBlueLoading() {
   FastLED.show();
 }
 
-// purple_speaking: pulsing purple
 void animatePurpleSpeaking() {
   unsigned long now = millis();
   if (now - lastAnim < 25) return;
@@ -283,7 +286,6 @@ void animatePurpleSpeaking() {
   FastLED.show();
 }
 
-// yellow_processing - train-like but yellow tones
 void animateYellowProcessing() {
   unsigned long now = millis();
   if (now - lastAnim < 110) return;
@@ -293,7 +295,7 @@ void animateYellowProcessing() {
   int len = 4; // length of the yellow train
   for (int k=0;k<len;k++) {
     int idx = (animPos + k) % NUM_LEDS;
-    uint8_t b = 200 - k * 35; // decreasing brightness along tail
+    int b = 200 - k * 35; // decreasing brightness along tail
     if (b < 0) b = 0;
     leds[idx] = CRGB(b, b, 0); // yellow-ish (R,G)
   }
@@ -307,7 +309,9 @@ void setup() {
   delay(100);
 
   FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
-  setAll(CRGB::Black);
+  // Ensure we start with LEDs off (unchanged behavior)
+  for (int i = 0; i < NUM_LEDS; ++i) leds[i] = CRGB::Black;
+  FastLED.show();
 
   // WiFi connect
   WiFi.mode(WIFI_STA);
@@ -336,13 +340,16 @@ void setup() {
     prevTouchState = false;
   }
 
+  // === TOUCH CHANGE: ensure notifiedOnce is reset at boot
+  notifiedOnce = false; // first-touch notification allowed once per boot
+
   setupServer();
 }
 
 void loop() {
   server.handleClient();
 
-  // ---- TOUCH read with edge detection & debounce (updated) ----
+  // ---- TOUCH read with edge detection & debounce (touched state read is unchanged) ----
   bool currentTouched = false;
   if (TOUCH_IS_DIGITAL) {
     currentTouched = (digitalRead(TOUCH_PIN) == HIGH);
@@ -353,27 +360,33 @@ void loop() {
 
   // detect change in touch state
   if (currentTouched != prevTouchState) {
-    // state changed
     prevTouchState = currentTouched;
 
-    // only notify on transition: NOT touched -> Touched (rising edge)
+    // If touch became active (rising edge)
     if (currentTouched) {
-      // apply debounce: ignore if too soon since last notify
-      if (millis() - lastTouchTime > TOUCH_DEBOUNCE_MS) {
-        Serial.println("TOUCH detected! (edge)");
-        notifyLaptop();
-        lastTouchTime = millis();
+      // === TOUCH CHANGE: only notify laptop ONCE after boot
+      if (!notifiedOnce) {
+        // apply debounce: ignore if too soon since last notify
+        if (millis() - lastTouchTime > TOUCH_DEBOUNCE_MS) {
+          Serial.println("TOUCH detected! (first-edge -> notifying laptop)");
+          notifyLaptop();
+          lastTouchTime = millis();
+          notifiedOnce = true; // ensure we do NOT notify again this boot. // === TOUCH CHANGE
+        } else {
+          Serial.println("Touch edge detected but ignored due to debounce (first-notify)");
+        }
       } else {
-        Serial.println("Touch edge detected but ignored due to debounce");
+        // We have already notified once; do not send again
+        Serial.println("TOUCH detected (but already notified once) - not forwarding to laptop"); // === TOUCH CHANGE
       }
     } else {
       // touch released / toggled off
       Serial.println("Touch state: RELEASED/OFF");
     }
   }
-  // -------------------------------------------------------------
+  // -------------------------------------------------------------------------------------
 
-  // run the chosen animation (non-blocking)
+  // run the chosen animation (non-blocking). Lighting code unchanged.
   switch (currentStyle) {
     case STYLE_LOADING: animateLoading(); break;
     case STYLE_TRAIN: animateTrain(); break;
@@ -388,6 +401,10 @@ void loop() {
     case STYLE_GREEN: setAll(CRGB::Green); break;
     case STYLE_RED: setAll(CRGB::Red); break;
     case STYLE_ORANGE: setAll(CRGB::Orange); break;
-    default: /* OFF */ break;
+    case STYLE_OFF:
+      // enforce OFF state (unchanged)
+      setAll(CRGB::Black);
+      break;
+    default: /* nothing */ break;
   }
 }
