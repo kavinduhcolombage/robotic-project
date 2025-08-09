@@ -1,0 +1,195 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+#include <math.h>
+#include <Adafruit_NeoPixel.h> // For addressable LEDs
+
+// ---------------- OLED SETTINGS ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+// I2C pins for ESP32
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Eye settings
+const int eyeRadius = 30;
+const int pupilRadius = 8;
+const int centerX = SCREEN_WIDTH / 2;
+const int centerY = SCREEN_HEIGHT / 2;
+int angle = 0;
+
+// ---------------- LED SETTINGS ----------------
+#define LED_PIN 5       // Data pin for WS2812
+#define NUM_LEDS 2      // You have 2 LEDs
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+unsigned long lastLedChange = 0;
+int ledMode = 0;
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  randomSeed(analogRead(34));
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 failed. Check wiring.");
+    while (1) delay(10);
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Init LED strip
+  strip.begin();
+  strip.show(); // Turn off all LEDs initially
+  strip.setBrightness(80); // Lower brightness if needed
+}
+
+// ---------------- MAIN LOOP ----------------
+void loop() {
+  // Eye animation
+  if (random(0, 100) < 5) {
+    blinkEyes();
+  } else {
+    moveEyes();
+  }
+
+  // LED animation
+  runLedEffects();
+
+  delay(80);
+}
+
+// ---------------- EYE FUNCTIONS ----------------
+void moveEyes() {
+  display.clearDisplay();
+
+  int xOffset = (int)(10.0 * cos(radians(angle)));
+  int yOffset = (int)(5.0 * sin(radians(angle)));
+
+  drawEye(display, centerX + xOffset, centerY + yOffset);
+
+  display.display();
+
+  angle = (angle + 8) % 360;
+}
+
+void blinkEyes() {
+  const int steps = 10;
+  for (int i = 0; i <= steps; i++) {
+    float t = (float)i / steps;
+    drawBlinkFrame(t);
+    delay(30);
+  }
+
+  delay(100);
+
+  for (int i = steps; i >= 0; i--) {
+    float t = (float)i / steps;
+    drawBlinkFrame(t);
+    delay(30);
+  }
+}
+
+void drawBlinkFrame(float blinkRatio) {
+  display.clearDisplay();
+
+  drawEye(display, centerX, centerY);
+
+  int lidHeight = (int)(SCREEN_HEIGHT * blinkRatio);
+
+  if (lidHeight > 0) {
+    display.fillRect(0, 0, SCREEN_WIDTH, lidHeight, SSD1306_BLACK);
+    display.fillRect(0, SCREEN_HEIGHT - lidHeight, SCREEN_WIDTH, lidHeight, SSD1306_BLACK);
+  }
+
+  display.display();
+}
+
+void drawEye(Adafruit_SSD1306 &d, int pupilX, int pupilY) {
+  d.drawCircle(centerX, centerY, eyeRadius, SSD1306_WHITE);
+  d.fillCircle(pupilX, pupilY, pupilRadius, SSD1306_WHITE);
+  drawEyelashes(d);
+}
+
+void drawEyelashes(Adafruit_SSD1306 &d) {
+  int lashY = centerY - eyeRadius - 2;
+  int lashLen = 6;
+
+  d.drawLine(centerX - 12, lashY, centerX - 12 - 2, lashY - lashLen, SSD1306_WHITE);
+  d.drawLine(centerX, lashY, centerX, lashY - lashLen, SSD1306_WHITE);
+  d.drawLine(centerX + 12, lashY, centerX + 12 + 2, lashY - lashLen, SSD1306_WHITE);
+}
+
+// ---------------- LED FUNCTIONS ----------------
+void runLedEffects() {
+  if (millis() - lastLedChange > 2000) { // Change mode every 2s
+    ledMode = random(0, 4); // Pick random mode (0-3)
+    lastLedChange = millis();
+  }
+
+  switch (ledMode) {
+    case 0:
+      rainbowStatic();
+      break;
+    case 1:
+      colorWipe(strip.Color(random(0, 255), random(0, 255), random(0, 255)));
+      break;
+    case 2:
+      theaterChase(strip.Color(random(0, 255), random(0, 255), random(0, 255)), 50);
+      break;
+    case 3:
+      pulse(strip.Color(random(0, 255), random(0, 255), random(0, 255)), 5);
+      break;
+  }
+}
+
+void rainbowStatic() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    int hue = (i * 65536L / NUM_LEDS) + (millis() / 10);
+    strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(hue)));
+  }
+  strip.show();
+}
+
+void colorWipe(uint32_t color) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+}
+
+void theaterChase(uint32_t color, int wait) {
+  static int q = 0;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if ((i + q) % 2 == 0) {
+      strip.setPixelColor(i, color);
+    } else {
+      strip.setPixelColor(i, 0);
+    }
+  }
+  strip.show();
+  q = (q + 1) % 2;
+}
+
+void pulse(uint32_t color, int speed) {
+  static int brightness = 0;
+  static int fadeAmount = 5;
+  brightness += fadeAmount;
+  if (brightness <= 0 || brightness >= 255) fadeAmount = -fadeAmount;
+
+  strip.setBrightness(brightness);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+  delay(speed);
+}
